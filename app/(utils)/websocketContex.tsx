@@ -1,10 +1,8 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Client, IMessage } from '@stomp/stompjs';
-import axios from 'axios';
 import React, { createContext, ReactNode, useContext, useEffect, useRef, useState } from 'react';
 import SockJS from 'sockjs-client';
 
-// Types
 interface LocationUpdate {
   mechanicId: number;
   userId: number;
@@ -18,8 +16,10 @@ interface BookingNotification {
   mechanicId: number;
   problem: string;
   status: string;
-  latitude: number;
-  longitude: number;
+  latitude?: number;
+  longitude?: number;
+  totalAmount?: number;
+  billingDetails?: string;
 }
 
 interface WebSocketContextType {
@@ -37,323 +37,283 @@ interface WebSocketContextType {
 }
 
 const WebSocketContext = createContext<WebSocketContextType | undefined>(undefined);
-
-const BASE_URL = 'http://192.168.0.42:8080';
+const BASE_URL = "https://live-tracking-kpuj.onrender.com";
 
 export const useWebSocket = () => {
   const context = useContext(WebSocketContext);
-  if (!context) {
-    throw new Error('useWebSocket must be used within a WebSocketProvider');
-  }
+  if (!context) throw new Error('useWebSocket must be used within WebSocketProvider');
   return context;
 };
 
-interface WebSocketProviderProps {
-  children: ReactNode;
-}
-
-export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }) => {
+export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastLocationUpdate, setLastLocationUpdate] = useState<LocationUpdate | null>(null);
   const [lastBookingNotification, setLastBookingNotification] = useState<BookingNotification | null>(null);
-  
+
   const clientRef = useRef<Client | null>(null);
   const subscriptionsRef = useRef<Map<string, any>>(new Map());
 
-  // Initialize WebSocket connection using SockJS (as configured on backend)
+  const safeParse = (body: string): any => {
+    try {
+      let parsedBody = body;
+      if (typeof parsedBody === 'string' && parsedBody.startsWith('NEW_REQUEST:')) {
+        parsedBody = parsedBody.substring('NEW_REQUEST:'.length);
+      }
+      return JSON.parse(parsedBody);
+    } catch (err) {
+      console.error('❌ Failed to parse message:', body, err);
+      return null;
+    }
+  };
+
   const initializeConnection = async (userId: string, role: string) => {
     try {
-      console.log('Initializing SockJS connection to:', `${BASE_URL}/ws`);
+      console.log('🔌 Initializing WebSocket connection to:', `${BASE_URL}/ws`);
       const token = await AsyncStorage.getItem('authToken');
-      
-      // Create SockJS connection
+
       const socket = new SockJS(`${BASE_URL}/ws`);
-      
       const client = new Client({
         webSocketFactory: () => socket,
         connectHeaders: {
-          // Send token in headers if your backend needs it (optional)
           ...(token && { Authorization: `Bearer ${token}` }),
           userId: userId,
         },
-        debug: (str) => {
-          console.log('STOMP Debug:', str);
-        },
+        debug: (str) => console.log('🐞 STOMP:', str),
         reconnectDelay: 5000,
         heartbeatIncoming: 4000,
         heartbeatOutgoing: 4000,
         onConnect: () => {
-          console.log('✅ WebSocket Connected successfully');
+          console.log('✅ WebSocket connected successfully!');
           setIsConnected(true);
           setError(null);
-          
-          // Subscribe based on role
-          if (role === 'USER') {
+
+          const normalizedRole = role.replace('ROLE_', '');
+          if (normalizedRole === 'USER') {
+            console.log('📡 Subscribing to USER topics for userId:', userId);
             subscribeToUserTopics(userId);
-          } else if (role === 'MECHANIC') {
+          } else if (normalizedRole === 'MECHANIC') {
+            console.log('📡 Subscribing to MECHANIC topics for mechanicId:', userId);
             subscribeToMechanicTopics(userId);
+          } else {
+            console.warn('⚠️ Unknown role, cannot subscribe:', role);
           }
         },
         onStompError: (frame) => {
-          console.error('❌ STOMP Error:', frame);
+          console.error('❌ STOMP error:', frame);
           setError('STOMP connection error');
           setIsConnected(false);
         },
         onDisconnect: () => {
-          console.log('🔌 WebSocket Disconnected');
+          console.log('🔌 WebSocket disconnected');
           setIsConnected(false);
         },
         onWebSocketError: (event) => {
-          console.error('❌ WebSocket Error:', event);
+          console.error('❌ WebSocket error:', event);
           setError('WebSocket connection error');
           setIsConnected(false);
         },
       });
-      
+
       client.activate();
       clientRef.current = client;
-      
     } catch (err) {
-      console.error('Failed to initialize WebSocket:', err);
+      console.error('❌ Failed to initialize WebSocket:', err);
       setError('Failed to initialize WebSocket connection');
     }
   };
 
-  // Subscribe to user-specific topics (for normal users)
   const subscribeToUserTopics = (userId: string) => {
-    if (!clientRef.current || !clientRef.current.connected) return;
+    if (!clientRef.current?.connected) return;
     
-    console.log('Subscribing to user topics for userId:', userId);
-    
-    // Subscribe to mechanic location updates
-    const locationSubscription = clientRef.current.subscribe(
-      `/topic/user/${userId}`,
-      (message: IMessage) => {
-        try {
-          const locationData: LocationUpdate = JSON.parse(message.body);
-          console.log('📍 Location update received:', locationData);
-          setLastLocationUpdate(locationData);
-        } catch (err) {
-          console.error('Error parsing location update:', err);
-        }
+    // 📍 1. Main topic /topic/user/{userId}
+    const mainSub = clientRef.current.subscribe(`/topic/user/${userId}`, (msg: IMessage) => {
+      console.log(`📨 [TOPIC: /topic/user/${userId}] Message received:`, msg.body);
+      const data = safeParse(msg.body);
+      if (!data) return;
+      if (data.lat !== undefined) {
+        console.log('📍 Location update received:', data);
+        setLastLocationUpdate(data);
+      } else if (data.status) {
+        console.log(`🔔 Booking notification (${data.status}) received:`, data);
+        setLastBookingNotification(data);
       }
-    );
-    
-    // Subscribe to booking status updates
-    const bookingSubscription = clientRef.current.subscribe(
-      `/topic/user/${userId}`,
-      (message: IMessage) => {
-        try {
-          const notification: BookingNotification = JSON.parse(message.body);
-          if (notification.status) {
-            console.log('📝 Booking notification:', notification);
-            setLastBookingNotification(notification);
-          }
-        } catch (err) {
-          console.error('Error parsing booking notification:', err);
-        }
+    });
+    subscriptionsRef.current.set(`user_main_${userId}`, mainSub);
+    console.log(`✅ Subscribed to /topic/user/${userId}`);
+
+    // 2. Booking status topic
+    const bookingSub = clientRef.current.subscribe(`/topic/user/booking/${userId}`, (msg: IMessage) => {
+      console.log(`📨 [TOPIC: /topic/user/booking/${userId}] Message:`, msg.body);
+      const data = safeParse(msg.body);
+      if (data && data.status) {
+        console.log(`✅ Booking ${data.status} notification:`, data);
+        setLastBookingNotification(data);
       }
-    );
-    
-    subscriptionsRef.current.set(`user_location_${userId}`, locationSubscription);
-    subscriptionsRef.current.set(`user_booking_${userId}`, bookingSubscription);
+    });
+    subscriptionsRef.current.set(`user_booking_${userId}`, bookingSub);
+    console.log(`✅ Subscribed to /topic/user/booking/${userId}`);
+
+    // 3. Live tracking topic
+    const trackingSub = clientRef.current.subscribe(`/topic/user/tracking/${userId}`, (msg: IMessage) => {
+      console.log(`📨 [TOPIC: /topic/user/tracking/${userId}] Location update:`, msg.body);
+      const data = safeParse(msg.body);
+      if (data && data.lat !== undefined) {
+        console.log(`📍 Mechanic location: lat=${data.lat}, lon=${data.lon}`);
+        setLastLocationUpdate(data);
+      }
+    });
+    subscriptionsRef.current.set(`user_tracking_${userId}`, trackingSub);
+    console.log(`✅ Subscribed to /topic/user/tracking/${userId}`);
+
+    // 4. Complete topic
+    const completeSub = clientRef.current.subscribe(`/topic/user/complete/${userId}`, (msg: IMessage) => {
+      console.log(`📨 [TOPIC: /topic/user/complete/${userId}] Message:`, msg.body);
+      const data = safeParse(msg.body);
+      if (data && data.status === 'COMPLETED') {
+        console.log('🎉 Service completed notification:', data);
+        setLastBookingNotification(data);
+      }
+    });
+    subscriptionsRef.current.set(`user_complete_${userId}`, completeSub);
+    console.log(`✅ Subscribed to /topic/user/complete/${userId}`);
+
+    // 5. Bill generation topic
+    const billSub = clientRef.current.subscribe(`/topic/user/billGenerate/${userId}`, (msg: IMessage) => {
+      console.log(`📨 [TOPIC: /topic/user/billGenerate/${userId}] Bill notification:`, msg.body);
+      const data = safeParse(msg.body);
+      if (data && data.status === 'BILL_GENERATED') {
+        console.log(`💰 Bill generated: Amount ₹${data.totalAmount}`);
+        setLastBookingNotification(data);
+      }
+    });
+    subscriptionsRef.current.set(`user_bill_${userId}`, billSub);
+    console.log(`✅ Subscribed to /topic/user/billGenerate/${userId}`);
+
+    // 6. Rejection topic
+    const rejectSub = clientRef.current.subscribe(`/topic/user/reject/${userId}`, (msg: IMessage) => {
+      console.log(`📨 [TOPIC: /topic/user/reject/${userId}] Rejection:`, msg.body);
+      const data = safeParse(msg.body);
+      if (data && data.status === 'REJECTED') {
+        console.log('❌ Booking rejected notification:', data);
+        setLastBookingNotification(data);
+      }
+    });
+    subscriptionsRef.current.set(`user_reject_${userId}`, rejectSub);
+    console.log(`✅ Subscribed to /topic/user/reject/${userId}`);
   };
 
-  // Subscribe to mechanic-specific topics (for mechanics)
   const subscribeToMechanicTopics = (mechanicId: string) => {
-    if (!clientRef.current || !clientRef.current.connected) return;
+    if (!clientRef.current?.connected) return;
     
-    console.log('Subscribing to mechanic topics for mechanicId:', mechanicId);
-    
-    // Subscribe to new booking requests
-    const bookingRequestSubscription = clientRef.current.subscribe(
-      `/topic/mechanic/${mechanicId}`,
-      (message: IMessage) => {
-        try {
-          const notification: BookingNotification = JSON.parse(message.body);
-          console.log('🔧 New booking request for mechanic:', notification);
-          setLastBookingNotification(notification);
-        } catch (err) {
-          console.error('Error parsing booking request:', err);
-        }
+    console.log(`📡 Subscribing to mechanic topics for mechanicId: ${mechanicId}`);
+    const sub = clientRef.current.subscribe(`/topic/mechanic/${mechanicId}`, (msg: IMessage) => {
+      console.log(`📨 [TOPIC: /topic/mechanic/${mechanicId}] New booking notification:`, msg.body);
+      const data = safeParse(msg.body);
+      if (data) {
+        console.log(`🔧 New booking request from user ${data.userId}, problem: ${data.problem}`);
+        setLastBookingNotification(data);
       }
-    );
-    
-    subscriptionsRef.current.set(`mechanic_booking_${mechanicId}`, bookingRequestSubscription);
+    });
+    subscriptionsRef.current.set(`mechanic_core_${mechanicId}`, sub);
+    console.log(`✅ Subscribed to /topic/mechanic/${mechanicId}`);
   };
 
-  // Public method to subscribe to mechanic location updates
   const subscribeToMechanicLocation = (userId: number, callback: (location: LocationUpdate) => void) => {
-    if (!clientRef.current || !clientRef.current.connected) {
-      console.log('WebSocket not connected, cannot subscribe to location');
-      return;
-    }
-    
-    const subscription = clientRef.current.subscribe(
-      `/topic/user/${userId}`,
-      (message: IMessage) => {
-        try {
-          const locationData: LocationUpdate = JSON.parse(message.body);
-          callback(locationData);
-        } catch (err) {
-          console.error('Error in location callback:', err);
-        }
+    if (!clientRef.current?.connected) return;
+    console.log(`📡 Subscribing to location for userId: ${userId}`);
+    const sub = clientRef.current.subscribe(`/topic/user/${userId}`, (msg: IMessage) => {
+      const data = safeParse(msg.body);
+      if (data && data.lat !== undefined) {
+        console.log(`📍 Location callback triggered for user ${userId}`);
+        callback(data);
       }
-    );
-    
-    subscriptionsRef.current.set(`location_callback_${userId}`, subscription);
+    });
+    subscriptionsRef.current.set(`loc_cb_${userId}`, sub);
   };
 
-  // Public method to subscribe to booking status
   const subscribeToBookingStatus = (userId: number, callback: (notification: BookingNotification) => void) => {
-    if (!clientRef.current || !clientRef.current.connected) {
-      console.log('WebSocket not connected, cannot subscribe to booking status');
-      return;
-    }
-    
-    const subscription = clientRef.current.subscribe(
-      `/topic/user/${userId}`,
-      (message: IMessage) => {
-        try {
-          const notification: BookingNotification = JSON.parse(message.body);
-          if (notification.status) {
-            callback(notification);
-          }
-        } catch (err) {
-          console.error('Error in booking callback:', err);
-        }
+    if (!clientRef.current?.connected) return;
+    console.log(`📡 Subscribing to booking status for userId: ${userId}`);
+    const sub = clientRef.current.subscribe(`/topic/user/${userId}`, (msg: IMessage) => {
+      const data = safeParse(msg.body);
+      if (data && data.status) {
+        console.log(`🔔 Booking status callback: ${data.status} for user ${userId}`);
+        callback(data);
       }
-    );
-    
-    subscriptionsRef.current.set(`booking_callback_${userId}`, subscription);
+    });
+    subscriptionsRef.current.set(`booking_cb_${userId}`, sub);
   };
 
-  // Public method to subscribe to mechanic booking requests
   const subscribeToMechanicBooking = (mechanicId: number, callback: (notification: BookingNotification) => void) => {
-    if (!clientRef.current || !clientRef.current.connected) {
-      console.log('WebSocket not connected, cannot subscribe to mechanic bookings');
+    if (!clientRef.current?.connected) return;
+    console.log(`📡 Subscribing to mechanic bookings for mechanicId: ${mechanicId}`);
+    const sub = clientRef.current.subscribe(`/topic/mechanic/${mechanicId}`, (msg: IMessage) => {
+      const data = safeParse(msg.body);
+      if (data) {
+        console.log(`🔧 Mechanic booking callback: new request for mechanic ${mechanicId}`);
+        callback(data);
+      }
+    });
+    subscriptionsRef.current.set(`mech_cb_${mechanicId}`, sub);
+  };
+
+  const sendLocationUpdate = (mechanicId: number, userId: number, lat: number, lon: number) => {
+    if (!clientRef.current?.connected) {
+      console.error('❌ WebSocket not connected, cannot send location');
       return;
     }
-    
-    const subscription = clientRef.current.subscribe(
-      `/topic/mechanic/${mechanicId}`,
-      (message: IMessage) => {
-        try {
-          const notification: BookingNotification = JSON.parse(message.body);
-          callback(notification);
-        } catch (err) {
-          console.error('Error in mechanic booking callback:', err);
-        }
-      }
-    );
-    
-    subscriptionsRef.current.set(`mechanic_booking_callback_${mechanicId}`, subscription);
+    const destination = '/app/mechanic/location';
+    const payload = JSON.stringify({ userId, lat, lon });
+    clientRef.current.publish({ destination, body: payload });
+    console.log(`📤 Sent location via STOMP: mechanicId=${mechanicId}, userId=${userId}, lat=${lat}, lon=${lon}`);
   };
 
-  // Send location update (mechanic to user) via REST API
-  const sendLocationUpdate = (mechanicId: number, userId: number, lat: number, lon: number) => {
-    const locationData = {
-      mechanicId,
-      userId,
-      lat,
-      lon,
-      timestamp: new Date().toISOString()
-    };
-    
-    axios.post(`${BASE_URL}/api/tracking/mechanic-location`, locationData)
-      .then(() => {
-        console.log('Location update sent successfully');
-      })
-      .catch((err) => {
-        console.error('Failed to send location update:', err);
-      });
-  };
-
-  // Manual connect function
   const connect = async (userId: string, role: string) => {
-    try {
-      console.log('Manual connect called with userId:', userId, 'role:', role);
-      
-      if (clientRef.current && clientRef.current.connected) {
-        console.log('WebSocket already connected');
-        return;
-      }
-      
-      if (clientRef.current) {
-        disconnect();
-      }
-      
-      await initializeConnection(userId, role);
-    } catch (err) {
-      console.error('Manual connect failed:', err);
-      setError('Failed to connect');
-      throw err;
+    if (clientRef.current?.connected) {
+      console.log('⚠️ WebSocket already connected');
+      return;
     }
+    if (clientRef.current) disconnect();
+    await initializeConnection(userId, role);
   };
 
-  // Reconnect function
   const reconnect = async () => {
-    try {
-      const userRole = await AsyncStorage.getItem('userRole');
-      const userId = await AsyncStorage.getItem('userId');
-      
-      if (userRole && userId) {
-        disconnect();
-        await initializeConnection(userId, userRole);
-      } else {
-        throw new Error('User data not found');
-      }
-    } catch (err) {
-      console.error('Reconnect failed:', err);
-      setError('Failed to reconnect');
-      throw err;
+    const userId = await AsyncStorage.getItem('userId');
+    const role = await AsyncStorage.getItem('userRole');
+    if (userId && role) {
+      console.log('🔄 Reconnecting WebSocket...');
+      disconnect();
+      await initializeConnection(userId, role);
+    } else {
+      throw new Error('User data not found');
     }
   };
 
-  // Disconnect WebSocket
   const disconnect = () => {
     if (clientRef.current) {
-      subscriptionsRef.current.forEach((subscription) => {
-        if (subscription && subscription.unsubscribe) {
-          subscription.unsubscribe();
-        }
-      });
+      console.log('🔌 Disconnecting WebSocket...');
+      subscriptionsRef.current.forEach(sub => sub?.unsubscribe());
       subscriptionsRef.current.clear();
-      
-      if (clientRef.current.connected) {
-        clientRef.current.deactivate();
-      }
+      if (clientRef.current.connected) clientRef.current.deactivate();
       clientRef.current = null;
       setIsConnected(false);
-      console.log('WebSocket disconnected manually');
+      console.log('✅ WebSocket disconnected');
     }
   };
 
-  // Auto-connect when user is logged in
   useEffect(() => {
     const autoConnect = async () => {
-      try {
-        const token = await AsyncStorage.getItem('authToken');
-        const userRole = await AsyncStorage.getItem('userRole');
-        const userEmail = await AsyncStorage.getItem('userEmail');
-        
-        if (token && userRole && userEmail) {
-          const userId = await AsyncStorage.getItem('userId');
-          if (userId) {
-            await initializeConnection(userId, userRole);
-          }
-        }
-      } catch (err) {
-        console.error('Auto-connect error:', err);
+      const token = await AsyncStorage.getItem('authToken');
+      const role = await AsyncStorage.getItem('userRole');
+      const userId = await AsyncStorage.getItem('userId');
+      if (token && role && userId) {
+        console.log('🚀 Auto-connecting WebSocket...');
+        await initializeConnection(userId, role);
       }
     };
-    
     autoConnect();
-    
-    return () => {
-      disconnect();
-    };
+    return () => disconnect();
   }, []);
 
   const value = {
@@ -370,9 +330,5 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({ children }
     reconnect,
   };
 
-  return (
-    <WebSocketContext.Provider value={value}>
-      {children}
-    </WebSocketContext.Provider>
-  );
+  return <WebSocketContext.Provider value={value}>{children}</WebSocketContext.Provider>;
 };

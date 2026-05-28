@@ -1,8 +1,8 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import axios, {
-    AxiosError,
-    AxiosInstance,
-    InternalAxiosRequestConfig,
+  AxiosError,
+  AxiosInstance,
+  InternalAxiosRequestConfig,
 } from 'axios';
  
 
@@ -40,4 +40,7 @@ const createAxiosInstance = (baseURL: string): AxiosInstance => {
   return instance;
 };
 
-export const rootApi: AxiosInstance = createAxiosInstance("http://192.168.0.42:8080");
+// const URL = "https://live-tracking-4e7b.onrender.com"
+const URL = "https://live-tracking-kpuj.onrender.com"
+
+export const rootApi: AxiosInstance = createAxiosInstance(URL);
